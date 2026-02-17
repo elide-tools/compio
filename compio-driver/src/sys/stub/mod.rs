@@ -78,6 +78,10 @@ impl Driver {
         futures_util::task::noop_waker()
     }
 
+    pub fn drain_ready_user_data(&mut self, _: &mut Vec<usize>) -> usize {
+        0
+    }
+
     pub fn create_buffer_pool(&mut self, _: u16, _: usize) -> io::Result<BufferPool> {
         Err(stub_error())
     }
