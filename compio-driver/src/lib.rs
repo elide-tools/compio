@@ -180,6 +180,21 @@ impl Proactor {
         self.driver.poll(timeout)
     }
 
+    /// Get the raw user data token used by the underlying driver for a key.
+    ///
+    /// This token is stable for the lifetime of the operation and can be used
+    /// to correlate readiness notifications with externally tracked state.
+    pub fn user_data<T>(&self, key: &Key<T>) -> usize {
+        key.as_raw()
+    }
+
+    /// Drain user data tokens for ops completed since the previous drain.
+    ///
+    /// Returns the number of drained tokens appended to `out`.
+    pub fn drain_ready_user_data(&mut self, out: &mut Vec<usize>) -> usize {
+        self.driver.drain_ready_user_data(out)
+    }
+
     /// Get the pushed operations from the completion entries.
     ///
     /// # Panics

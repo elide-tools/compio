@@ -177,6 +177,13 @@ impl Driver {
         }
     }
 
+    pub fn drain_ready_user_data(&mut self, out: &mut Vec<usize>) -> usize {
+        match &mut self.fuse {
+            FuseDriver::Poll(driver) => driver.drain_ready_user_data(out),
+            FuseDriver::IoUring(driver) => driver.drain_ready_user_data(out),
+        }
+    }
+
     pub fn create_buffer_pool(
         &mut self,
         buffer_len: u16,

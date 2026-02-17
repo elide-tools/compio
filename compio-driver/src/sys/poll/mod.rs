@@ -288,6 +288,7 @@ pub(crate) struct Driver {
     pool: AsyncifyPool,
     completed_tx: Sender<Entry>,
     completed_rx: Receiver<Entry>,
+    ready_user_data: VecDeque<usize>,
 }
 
 impl Driver {
@@ -311,6 +312,7 @@ impl Driver {
             pool: builder.create_or_get_thread_pool(),
             completed_tx,
             completed_rx,
+            ready_user_data: VecDeque::new(),
         })
     }
 
@@ -551,6 +553,7 @@ impl Driver {
     fn poll_completed(&mut self) -> bool {
         let mut ret = false;
         while let Ok(entry) = self.completed_rx.try_recv() {
+            self.ready_user_data.push_back(entry.user_data());
             entry.notify();
             ret = true;
         }
@@ -585,6 +588,7 @@ impl Driver {
                 }
                 Poll::Ready(res) => {
                     drop(op);
+                    self.ready_user_data.push_back(key.as_raw());
                     Entry::new(key, res).notify()
                 }
             };
@@ -649,6 +653,7 @@ impl Driver {
                             }
                         };
                         let key = unsafe { ErasedKey::from_raw(event.key) };
+                        this.ready_user_data.push_back(event.key);
                         Entry::new(key, res).notify()
                     }
                 }
@@ -660,6 +665,16 @@ impl Driver {
 
     pub fn waker(&self) -> Waker {
         Waker::from(self.notify.clone())
+    }
+
+    pub fn drain_ready_user_data(&mut self, out: &mut Vec<usize>) -> usize {
+        let count = self.ready_user_data.len();
+        if count == 0 {
+            return 0;
+        }
+        out.reserve(count);
+        out.extend(self.ready_user_data.drain(..));
+        count
     }
 
     pub fn create_buffer_pool(

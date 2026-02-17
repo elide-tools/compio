@@ -2,6 +2,7 @@
 #[allow(unused_imports)]
 pub use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::{
+    collections::VecDeque,
     io,
     os::fd::FromRawFd,
     pin::Pin,
@@ -144,6 +145,7 @@ pub(crate) struct Driver {
     completed_tx: Sender<Entry>,
     completed_rx: Receiver<Entry>,
     buffer_group_ids: Slab<()>,
+    ready_user_data: VecDeque<usize>,
     need_push_notifier: bool,
 }
 
@@ -183,6 +185,7 @@ impl Driver {
             completed_rx,
             pool: builder.create_or_get_thread_pool(),
             buffer_group_ids: Slab::new(),
+            ready_user_data: VecDeque::new(),
             need_push_notifier: true,
         })
     }
@@ -245,6 +248,7 @@ impl Driver {
 
     fn poll_blocking(&mut self) {
         while let Ok(entry) = self.completed_rx.try_recv() {
+            self.ready_user_data.push_back(entry.user_data());
             entry.notify();
         }
     }
@@ -265,7 +269,10 @@ impl Driver {
                     }
                     self.notifier.clear().expect("cannot clear notifier");
                 }
-                _ => create_entry(entry).notify(),
+                user_data => {
+                    self.ready_user_data.push_back(user_data as _);
+                    create_entry(entry).notify();
+                }
             }
         }
         has_entry
@@ -395,12 +402,38 @@ impl Driver {
             self.need_push_notifier = false;
         }
 
-        if !self.poll_entries() {
-            self.submit_auto(timeout)?;
+        let had_entries = self.poll_entries();
+        let need_submit = !self.inner.submission().is_empty();
+        if !had_entries || need_submit {
+            let submit_timeout = if had_entries {
+                Some(Duration::ZERO)
+            } else {
+                timeout
+            };
+            match self.submit_auto(submit_timeout) {
+                Ok(()) => {}
+                Err(e)
+                    if had_entries
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                        ) => {}
+                Err(e) => return Err(e),
+            }
             self.poll_entries();
         }
 
         Ok(())
+    }
+
+    pub fn drain_ready_user_data(&mut self, out: &mut Vec<usize>) -> usize {
+        let count = self.ready_user_data.len();
+        if count == 0 {
+            return 0;
+        }
+        out.reserve(count);
+        out.extend(self.ready_user_data.drain(..));
+        count
     }
 
     pub fn waker(&self) -> Waker {

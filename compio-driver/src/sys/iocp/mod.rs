@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     os::windows::io::{
         AsHandle, AsRawHandle, AsRawSocket, AsSocket, BorrowedHandle, BorrowedSocket, OwnedHandle,
@@ -319,6 +319,7 @@ pub(crate) struct Driver {
     notify: Arc<Notify>,
     waits: HashMap<usize, wait::Wait>,
     pool: AsyncifyPool,
+    ready_user_data: VecDeque<usize>,
 }
 
 impl Driver {
@@ -333,6 +334,7 @@ impl Driver {
             notify,
             waits: HashMap::default(),
             pool: builder.create_or_get_thread_pool(),
+            ready_user_data: VecDeque::new(),
         })
     }
 
@@ -459,6 +461,7 @@ impl Driver {
 
         for e in self.notify.port.poll(timeout)? {
             if let Some(e) = Self::create_entry(notify, &mut self.waits, e) {
+                self.ready_user_data.push_back(e.user_data());
                 e.notify()
             }
         }
@@ -468,6 +471,16 @@ impl Driver {
 
     pub fn waker(&self) -> Waker {
         Waker::from(self.notify.clone())
+    }
+
+    pub fn drain_ready_user_data(&mut self, out: &mut Vec<usize>) -> usize {
+        let count = self.ready_user_data.len();
+        if count == 0 {
+            return 0;
+        }
+        out.reserve(count);
+        out.extend(self.ready_user_data.drain(..));
+        count
     }
 
     pub fn create_buffer_pool(
