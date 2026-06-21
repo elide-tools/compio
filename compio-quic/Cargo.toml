@@ -71,6 +71,7 @@ native-certs = ["dep:rustls-native-certs"]
 webpki-roots = ["dep:webpki-roots"]
 h3 = ["dep:h3", "dep:h3-datagram"]
 ring = ["quinn-proto/rustls-ring"]
+aws-lc-rs = ["quinn-proto/rustls-aws-lc-rs"]
 windows-gro = []
 sync = []
 
