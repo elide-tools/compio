@@ -15,6 +15,7 @@ impl Extra {
         }
     }
 
+    #[allow(dead_code)]
     pub fn next_fd(&self) -> Option<RawFd> {
         self.track.iter().find(|t| !t.ready).map(|t| t.arg.fd)
     }

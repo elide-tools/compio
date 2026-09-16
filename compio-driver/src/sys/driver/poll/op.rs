@@ -66,6 +66,17 @@ pub unsafe trait OpCode {
         None
     }
 
+    /// The single source and interest this operation waits on when it cannot complete
+    /// immediately, if it has one.
+    ///
+    /// Returning `Some` lets the driver skip [`OpCode::pre_submit`] while it knows the source is
+    /// not ready for that interest, which turns a guaranteed `EAGAIN` syscall into nothing. The
+    /// answer must agree with what `pre_submit` would return; returning `None`, the default, keeps
+    /// the unconditional attempt. Operations waiting on more than one source must return `None`.
+    fn interest_hint(&mut self, _: &mut Self::Control) -> Option<WaitArg> {
+        None
+    }
+
     /// Perform the operation after received corresponding
     /// event. If this operation is blocking, the return value should be
     /// [`Poll::Ready`].
@@ -90,6 +101,7 @@ pub unsafe trait OpCode {
 pub(crate) trait Carry {
     fn pre_submit(&mut self) -> io::Result<Decision>;
     fn op_type(&mut self) -> Option<OpType>;
+    fn interest_hint(&mut self) -> Option<WaitArg>;
     fn operate(&mut self) -> Poll<io::Result<usize>>;
     unsafe fn set_result(&mut self, _: &io::Result<usize>, _: &crate::Extra);
 }
@@ -115,6 +127,11 @@ impl<T: crate::OpCode> Carry for Carrier<T> {
     fn op_type(&mut self) -> Option<OpType> {
         let (op, control) = self.as_poll();
         op.op_type(control)
+    }
+
+    fn interest_hint(&mut self) -> Option<WaitArg> {
+        let (op, control) = self.as_poll();
+        op.interest_hint(control)
     }
 
     fn operate(&mut self) -> Poll<io::Result<usize>> {

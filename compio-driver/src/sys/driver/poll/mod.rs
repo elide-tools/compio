@@ -6,46 +6,76 @@ use std::{
 };
 
 use flume::{Receiver, Sender};
-use polling::{Event, Events, Poller};
+use polling::{Event, Events, PollMode, Poller};
 
 mod op;
 pub use op::*;
 
 use crate::{
     AsyncifyPool, Entry,
-    key::BorrowedKey,
     panic::catch_unwind_io,
     sys::{driver::AwakeFlag, extra::PollExtra, prelude::*},
 };
+
+/// Registration mode used for every source.
+///
+/// Level triggering keeps a source reporting readiness for as long as an
+/// operation is queued for it, so a source is registered once and only changed
+/// when the set of queued interests changes. Edge triggering would require
+/// every opcode to attempt its syscall before waiting, which is not part of the
+/// [`OpCode`] contract.
+const MODE: PollMode = PollMode::Level;
+
+/// Interests currently queued for, or registered on, one source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Mask {
+    readable: bool,
+    writable: bool,
+}
+
+impl Mask {
+    fn is_empty(self) -> bool {
+        !self.readable && !self.writable
+    }
+
+    fn get(self, interest: Interest) -> bool {
+        match interest {
+            Interest::Readable => self.readable,
+            Interest::Writable => self.writable,
+        }
+    }
+
+    fn set(&mut self, interest: Interest, value: bool) {
+        match interest {
+            Interest::Readable => self.readable = value,
+            Interest::Writable => self.writable = value,
+        }
+    }
+
+    fn event(self, fd: RawFd) -> Event {
+        let mut event = Event::none(fd as usize);
+        event.readable = self.readable;
+        event.writable = self.writable;
+        event
+    }
+}
 
 #[derive(Debug, Default)]
 struct FdQueue {
     read_queue: VecDeque<ErasedKey>,
     write_queue: VecDeque<ErasedKey>,
-}
-
-/// A token to remove an interest from `FdQueue`.
-///
-/// It is returned when an interest is pushed, and can be used to remove the
-/// interest later. However do be careful that the index may be invalid or does
-/// not correspond to the one inserted if other interests are added or removed
-/// before it (toctou).
-struct RemoveToken {
-    idx: usize,
-    is_read: bool,
-}
-
-impl RemoveToken {
-    fn read(idx: usize) -> Self {
-        Self { idx, is_read: true }
-    }
-
-    fn write(idx: usize) -> Self {
-        Self {
-            idx,
-            is_read: false,
-        }
-    }
+    /// Mask currently registered with the poller, or `None` when the source is
+    /// not registered.
+    armed: Option<Mask>,
+    /// Whether this fd is already listed in [`Driver::dirty`].
+    listed: bool,
+    /// Interests the source is believed not to be ready for, because an operation saw `EAGAIN` or
+    /// because the last readiness for that interest was consumed.
+    ///
+    /// Level triggering makes a wrong belief self-correcting: a source that is in fact ready
+    /// reports itself again as soon as it is registered, so the worst case is one delayed wakeup,
+    /// never a lost one.
+    stale: Mask,
 }
 
 impl FdQueue {
@@ -53,39 +83,18 @@ impl FdQueue {
         self.read_queue.is_empty() && self.write_queue.is_empty()
     }
 
-    fn remove_token(&mut self, token: RemoveToken) -> Option<ErasedKey> {
-        if token.is_read {
-            self.read_queue.remove(token.idx)
-        } else {
-            self.write_queue.remove(token.idx)
-        }
-    }
-
-    pub fn push_back_interest(&mut self, key: ErasedKey, interest: Interest) -> RemoveToken {
+    pub fn push_back_interest(&mut self, key: ErasedKey, interest: Interest) {
         match interest {
-            Interest::Readable => {
-                self.read_queue.push_back(key);
-                RemoveToken::read(self.read_queue.len() - 1)
-            }
-            Interest::Writable => {
-                self.write_queue.push_back(key);
-                RemoveToken::write(self.write_queue.len() - 1)
-            }
+            Interest::Readable => self.read_queue.push_back(key),
+            Interest::Writable => self.write_queue.push_back(key),
         }
     }
 
-    pub fn push_front_interest(&mut self, key: ErasedKey, interest: Interest) -> RemoveToken {
-        let is_read = match interest {
-            Interest::Readable => {
-                self.read_queue.push_front(key);
-                true
-            }
-            Interest::Writable => {
-                self.write_queue.push_front(key);
-                false
-            }
-        };
-        RemoveToken { idx: 0, is_read }
+    pub fn push_front_interest(&mut self, key: ErasedKey, interest: Interest) {
+        match interest {
+            Interest::Readable => self.read_queue.push_front(key),
+            Interest::Writable => self.write_queue.push_front(key),
+        }
     }
 
     pub fn remove(&mut self, key: &ErasedKey) {
@@ -93,17 +102,12 @@ impl FdQueue {
         self.write_queue.retain(|k| k != key);
     }
 
-    pub fn event(&self) -> Event {
-        let mut event = Event::none(0);
-        if let Some(key) = self.read_queue.front() {
-            event.readable = true;
-            event.key = key.as_raw();
+    /// Interests the queued operations currently need.
+    fn desired(&self) -> Mask {
+        Mask {
+            readable: !self.read_queue.is_empty(),
+            writable: !self.write_queue.is_empty(),
         }
-        if let Some(key) = self.write_queue.front() {
-            event.writable = true;
-            event.key = key.as_raw();
-        }
-        event
     }
 
     pub fn pop_interest(&mut self, event: &Event) -> Option<(ErasedKey, Interest)> {
@@ -126,6 +130,8 @@ pub(crate) struct Driver {
     events: Events,
     notify: Arc<Notify>,
     registry: HashMap<RawFd, FdQueue>,
+    /// Sources whose desired mask may differ from the registered one.
+    dirty: Vec<RawFd>,
     pool: AsyncifyPool,
     completed_tx: Sender<Entry>,
     completed_rx: Receiver<Entry>,
@@ -142,6 +148,14 @@ impl Driver {
             Events::new()
         };
         let poll = Poller::new()?;
+        if !poll.supports_level() {
+            // Event ports (illumos, Solaris) are one-shot only; the registration
+            // model below has no one-shot path.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the poll driver needs level-triggered readiness",
+            ));
+        }
         let notify = Arc::new(Notify::new(poll));
         let (completed_tx, completed_rx) = flume::unbounded();
 
@@ -149,6 +163,7 @@ impl Driver {
             events,
             notify,
             registry: HashMap::new(),
+            dirty: Vec::new(),
             pool: builder.create_or_get_thread_pool(),
             completed_tx,
             completed_rx,
@@ -183,89 +198,193 @@ impl Driver {
         self.registry.get_mut(&fd)
     }
 
-    fn get_queue(&mut self, fd: RawFd) -> &mut FdQueue {
-        self.try_get_queue(fd).expect("the fd should be submitted")
+    /// Record that `fd`'s desired mask may have changed. The poller is only
+    /// touched by [`Driver::flush`], right before waiting.
+    fn mark_dirty(registry: &mut HashMap<RawFd, FdQueue>, dirty: &mut Vec<RawFd>, fd: RawFd) {
+        if let Some(queue) = registry.get_mut(&fd)
+            && !queue.listed
+        {
+            queue.listed = true;
+            dirty.push(fd);
+        }
+    }
+
+    /// Register or re-register `fd`. Falls back to a modification when the
+    /// source is still known to the poller, which happens when a previous
+    /// deletion could not be delivered (a closed fd drops out of the kernel's
+    /// interest list on its own).
+    fn register(&self, fd: RawFd, mask: Mask) -> io::Result<()> {
+        let event = mask.event(fd);
+        // SAFETY: the source is deleted before the driver is dropped.
+        match unsafe { self.poller().add_with_mode(fd, event, MODE) } {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // SAFETY: the caller keeps the descriptor open for the queued operations.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+                self.poller().modify_with_mode(borrowed, event, MODE)
+            }
+            res => res,
+        }
+    }
+
+    /// Apply every pending registration change. Sources whose desired mask is
+    /// unchanged since the last flush cost no syscall, so an operation that is
+    /// re-submitted before the driver waits again never re-registers.
+    ///
+    /// Returns whether any queued operation was completed with an error, which
+    /// the caller must treat as a reason not to sleep.
+    fn flush_registrations(&mut self) -> bool {
+        let mut failed = false;
+        while let Some(fd) = self.dirty.pop() {
+            let Some(queue) = self.registry.get_mut(&fd) else {
+                continue;
+            };
+            queue.listed = false;
+            let desired = queue.desired();
+            let armed = queue.armed;
+            if desired.is_empty() {
+                if armed.is_some() {
+                    self.forget(fd);
+                }
+                self.registry.remove(&fd);
+                continue;
+            }
+            if armed == Some(desired) {
+                continue;
+            }
+            let res = if armed.is_some() {
+                // SAFETY: the queued operations hold the descriptor open.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+                self.poller()
+                    .modify_with_mode(borrowed, desired.event(fd), MODE)
+            } else {
+                self.register(fd, desired)
+            };
+            match res {
+                Ok(()) => {
+                    if let Some(queue) = self.registry.get_mut(&fd) {
+                        queue.armed = Some(desired);
+                    }
+                }
+                Err(e) => {
+                    self.fail_queue(fd, &e);
+                    failed = true;
+                }
+            }
+        }
+        failed
+    }
+
+    /// Drop an armed registration whose owner may already have closed the
+    /// descriptor. Closing removed it from the kernel's interest list, so the
+    /// removal error carries no information; the number is never borrowed.
+    fn forget(&self, fd: RawFd) {
+        // SAFETY: the source was added to this poller, and `attach` forgets a
+        // reused number before its new owner is registered.
+        unsafe { self.poller().delete_raw(fd) }.ok();
+    }
+
+    /// Complete every operation queued on `fd` with `error` and forget the
+    /// source. Used when a registration change cannot be applied.
+    fn fail_queue(&mut self, fd: RawFd, error: &io::Error) {
+        let Some(mut queue) = self.registry.remove(&fd) else {
+            return;
+        };
+        if queue.armed.is_some() {
+            self.forget(fd);
+        }
+        // One operation may sit in both queues, and in other descriptors'
+        // queues (`Splice` waits on two); complete it once and drop it
+        // everywhere first, as `cancel` does, so no later readiness or
+        // cancellation touches a completed key.
+        let mut keys: Vec<ErasedKey> = Vec::new();
+        for key in queue
+            .read_queue
+            .drain(..)
+            .chain(queue.write_queue.drain(..))
+        {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        for key in keys {
+            let op_type = key.borrow().carrier.op_type();
+            if let Some(OpType::Fd(fds)) = op_type {
+                for other in fds {
+                    if other != fd {
+                        self.remove_one(&key, other);
+                    }
+                }
+            }
+            let res = Err(match error.raw_os_error() {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::from(error.kind()),
+            });
+            Entry::new(key, res).notify();
+        }
     }
 
     /// Submit a new operation to the end of the queue.
     ///
     ///  # Safety
     /// The input fd should be valid.
-    unsafe fn submit(&mut self, key: ErasedKey, arg: WaitArg) -> io::Result<()> {
+    unsafe fn submit(&mut self, key: ErasedKey, arg: WaitArg) {
         let Self {
-            registry, notify, ..
+            registry, dirty, ..
         } = self;
-        let need_add = !registry.contains_key(&arg.fd);
         let queue = registry.entry(arg.fd).or_default();
-        let token = queue.push_back_interest(key, arg.interest);
-        let event = queue.event();
-        let res = if need_add {
-            // SAFETY: the events are deleted correctly.
-            unsafe { notify.poll.add(arg.fd, event) }
-        } else {
-            let fd = unsafe { BorrowedFd::borrow_raw(arg.fd) };
-            notify.poll.modify(fd, event)
-        };
-        if res.is_err() {
-            // Rollback the push if submission failed.
-            queue.remove_token(token);
-            if queue.is_empty() {
-                registry.remove(&arg.fd);
-            }
-        }
-
-        res
+        queue.push_back_interest(key, arg.interest);
+        Self::mark_dirty(registry, dirty, arg.fd);
     }
 
     /// Submit a new operation to the front of the queue.
     ///
     /// # Safety
     /// The input fd should be valid.
-    unsafe fn submit_front(&mut self, key: ErasedKey, arg: WaitArg) -> io::Result<()> {
-        let need_add = !self.registry.contains_key(&arg.fd);
-        let queue = self.registry.entry(arg.fd).or_default();
+    unsafe fn submit_front(&mut self, key: ErasedKey, arg: WaitArg) {
+        let Self {
+            registry, dirty, ..
+        } = self;
+        let queue = registry.entry(arg.fd).or_default();
         queue.push_front_interest(key, arg.interest);
-        let event = queue.event();
-        if need_add {
-            // SAFETY: the events are deleted correctly.
-            unsafe { self.poller().add(arg.fd, event)? }
-        } else {
-            let fd = unsafe { BorrowedFd::borrow_raw(arg.fd) };
-            self.poller().modify(fd, event)?;
-        }
-        Ok(())
-    }
-
-    fn renew(&mut self, fd: BorrowedFd, renew_event: Event) -> io::Result<()> {
-        if !renew_event.readable && !renew_event.writable {
-            self.poller().delete(fd)?;
-            self.registry.remove(&fd.as_raw_fd());
-        } else {
-            self.poller().modify(fd, renew_event)?;
-        }
-        Ok(())
+        Self::mark_dirty(registry, dirty, arg.fd);
     }
 
     /// Remove one interest from the queue.
-    fn remove_one(&mut self, key: &ErasedKey, fd: RawFd) -> io::Result<()> {
-        let Some(queue) = self.try_get_queue(fd) else {
-            return Ok(());
+    fn remove_one(&mut self, key: &ErasedKey, fd: RawFd) {
+        let Self {
+            registry, dirty, ..
+        } = self;
+        let Some(queue) = registry.get_mut(&fd) else {
+            return;
         };
         queue.remove(key);
-        let renew_event = queue.event();
-        if queue.is_empty() {
-            self.registry.remove(&fd);
-        }
-        self.renew(unsafe { BorrowedFd::borrow_raw(fd) }, renew_event)
+        Self::mark_dirty(registry, dirty, fd);
     }
 
     /// Remove one interest from the queue, and emit a cancelled entry.
-    fn cancel_one(&mut self, key: ErasedKey, fd: RawFd) -> Option<Entry> {
-        self.remove_one(&key, fd)
-            .map_or(None, |_| Some(Entry::new_cancelled(key)))
+    fn cancel_one(&mut self, key: ErasedKey, fd: RawFd) -> Entry {
+        self.remove_one(&key, fd);
+        Entry::new_cancelled(key)
     }
 
-    pub fn attach(&mut self, _fd: RawFd) -> io::Result<()> {
+    /// Forget any registration state left over from a previous owner of this
+    /// descriptor number.
+    ///
+    /// # Errors
+    /// Never fails; the signature matches the other drivers.
+    pub fn attach(&mut self, fd: RawFd) -> io::Result<()> {
+        if let Some(queue) = self.registry.remove(&fd) {
+            // A descriptor number can only be reattached after the previous
+            // descriptor was closed. Pending operations cannot outlive that
+            // close, and the kernel drops a closed fd from its interest list,
+            // but a user-space table (the `poll(2)` backend) does not, so the
+            // stale registration is removed by number rather than left behind.
+            debug_assert!(queue.is_empty(), "attaching an fd with queued operations");
+            if queue.armed.is_some() {
+                self.forget(fd);
+            }
+            self.dirty.retain(|listed| *listed != fd);
+        }
         Ok(())
     }
 
@@ -277,7 +396,7 @@ impl Driver {
                 let mut pushed = false;
                 for fd in fds {
                     let entry = self.cancel_one(key.clone(), fd);
-                    if !pushed && let Some(entry) = entry {
+                    if !pushed {
                         _ = self.completed_tx.send(entry);
                         pushed = true;
                     }
@@ -294,6 +413,23 @@ impl Driver {
 
     pub fn push(&mut self, key: ErasedKey) -> Poll<io::Result<usize>> {
         instrument!(compio_log::Level::TRACE, "push", ?key);
+        // Skip the attempt when the source is known not to be ready for this operation's interest:
+        // it would only spend a syscall to be told so.
+        let hint = { key.borrow().carrier.interest_hint() };
+        if let Some(arg) = hint
+            && self
+                .registry
+                .get(&arg.fd)
+                .is_some_and(|queue| queue.stale.get(arg.interest))
+        {
+            key.borrow()
+                .extra_mut()
+                .as_poll_mut()
+                .set_args(Multi::from_buf([arg]));
+            // SAFETY: fd is from the OpCode.
+            unsafe { self.submit(key, arg) };
+            return Poll::Pending;
+        }
         match { key.borrow().carrier.pre_submit()? } {
             Decision::Wait(args) => {
                 key.borrow()
@@ -302,14 +438,9 @@ impl Driver {
                     .set_args(args.clone());
                 for arg in args.iter().copied() {
                     // SAFETY: fd is from the OpCode.
-                    let res = unsafe { self.submit(key.clone(), arg) };
-                    // if submission fails, remove all previously submitted fds.
-                    if let Err(e) = res {
-                        args.into_iter().for_each(|arg| {
-                            // we don't care about renew errors
-                            let _ = self.remove_one(&key, arg.fd);
-                        });
-                        return Poll::Ready(Err(e));
+                    unsafe { self.submit(key.clone(), arg) };
+                    if let Some(queue) = self.registry.get_mut(&arg.fd) {
+                        queue.stale.set(arg.interest, true);
                     }
                     trace!("register {:?}", arg);
                 }
@@ -391,8 +522,13 @@ impl Driver {
         }
     }
 
+    /// Prepare for an external wait on the driver's fd: apply pending
+    /// registrations, then reset the notifier. Returns whether the caller
+    /// should poll right away instead of waiting, because a notification was
+    /// pending or a registration failure already completed queued operations.
     pub fn flush(&mut self) -> bool {
-        self.notify.reset()
+        let failed = self.flush_registrations();
+        self.notify.reset() || failed
     }
 
     fn poll_completed(&mut self) -> bool {
@@ -405,49 +541,68 @@ impl Driver {
     }
 
     #[allow(clippy::blocks_in_conditions)]
-    fn poll_one(&mut self, event: Event, fd: RawFd) -> io::Result<()> {
-        let queue = self.get_queue(fd);
+    fn poll_one(&mut self, event: Event, fd: RawFd) {
+        let Some(queue) = self.try_get_queue(fd) else {
+            // The source was dropped earlier in this batch; level triggering
+            // will report it again if an operation is queued later.
+            return;
+        };
 
-        if let Some((key, _)) = queue.pop_interest(&event)
-            && let mut op = key.borrow()
-            && op.extra_mut().as_poll_mut().handle_event(fd)
-        {
-            // Add brace here to force `Ref` drop within the scrutinee
-            match { op.carrier.operate() } {
-                // Submit all fd's back to the front of the queue
-                Poll::Pending => {
-                    let extra = op.extra_mut().as_poll_mut();
-                    extra.reset();
-                    // `FdQueue` may have been removed, need to submit again
-                    for t in extra.track.iter() {
-                        let res = unsafe { self.submit_front(key.clone(), t.arg) };
-                        if let Err(e) = res {
-                            // On error, remove all previously submitted fds.
-                            for t in extra.track.iter() {
-                                let _ = self.remove_one(&key, t.arg.fd);
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-                Poll::Ready(res) => {
-                    drop(op);
-                    Entry::new(key, res).notify()
-                }
-            };
+        // The report is current readiness, so it supersedes anything believed about the source.
+        if event.readable {
+            queue.stale.readable = false;
+        }
+        if event.writable {
+            queue.stale.writable = false;
         }
 
-        let renew_event = self.get_queue(fd).event();
-        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        self.renew(fd, renew_event)
+        let Some((key, interest)) = queue.pop_interest(&event) else {
+            return;
+        };
+        Self::mark_dirty(&mut self.registry, &mut self.dirty, fd);
+
+        let ready = {
+            let mut op = key.borrow();
+            op.extra_mut().as_poll_mut().handle_event(fd)
+        };
+        if !ready {
+            return;
+        }
+
+        let mut op = key.borrow();
+        match { op.carrier.operate() } {
+            // Submit all fd's back to the front of the queue
+            Poll::Pending => {
+                let extra = op.extra_mut().as_poll_mut();
+                extra.reset();
+                let args = extra.track.iter().map(|t| t.arg).collect::<Vec<_>>();
+                drop(op);
+                for arg in args {
+                    // SAFETY: fd is from the OpCode.
+                    unsafe { self.submit_front(key.clone(), arg) };
+                }
+            }
+            Poll::Ready(res) => {
+                drop(op);
+                // The operation consumed this readiness. Assume it is spent; level triggering
+                // reports the source again on the next wait if it is not.
+                if let Some(queue) = self.registry.get_mut(&fd) {
+                    queue.stale.set(interest, true);
+                }
+                Entry::new(key, res).notify()
+            }
+        }
     }
 
     pub fn poll(&mut self, mut timeout: Option<Duration>) -> io::Result<()> {
         instrument!(compio_log::Level::TRACE, "poll", ?timeout);
         let timeout_is_some = timeout.is_some();
+        // Apply registration changes accumulated since the last wait. A failed
+        // registration completes its operations here, so it must not sleep.
+        let failed = self.flush_registrations();
         let has_completed = !self.completed_rx.is_empty();
         let need_wait = !self.notify.reset();
-        if !need_wait || has_completed {
+        if !need_wait || has_completed || failed {
             timeout = Some(Duration::ZERO);
         }
         // We need to poll the poller first to make sure it handles the internal notify
@@ -468,43 +623,8 @@ impl Driver {
         self.with_events(|this, events| {
             for event in events.iter() {
                 trace!("receive {} for {:?}", event.key, event);
-                // SAFETY: user_data is promised to be valid.
-                let key = unsafe { BorrowedKey::from_raw(event.key) };
-                let mut op = key.borrow();
-                let op_type = op.carrier.op_type();
-                match op_type {
-                    None => {
-                        // On epoll, multiple event may be received even if it is registered as
-                        // one-shot. It is safe to ignore it.
-                        trace!("op {} is completed", event.key);
-                    }
-                    Some(OpType::Fd(_)) => {
-                        // FIXME: This should not happen
-                        let Some(fd) = op.extra().as_poll().next_fd() else {
-                            return Ok(());
-                        };
-                        drop(op);
-                        this.poll_one(event, fd)?;
-                    }
-                    #[cfg(aio)]
-                    Some(OpType::Aio(aiocbp)) => {
-                        drop(op);
-                        let err = unsafe { libc::aio_error(aiocbp.as_ptr()) };
-                        let res = match err {
-                            // If the user_data is reused but the previously registered event still
-                            // emits (for example, HUP in epoll; however it is impossible now
-                            // because we only use AIO on FreeBSD), we'd better ignore the current
-                            // one and wait for the real event.
-                            libc::EINPROGRESS => {
-                                trace!("op {} is not completed", key.as_raw());
-                                continue;
-                            }
-                            _ => syscall!(libc::aio_return(aiocbp.as_ptr())),
-                        };
-                        let key = unsafe { ErasedKey::from_raw(event.key) };
-                        Entry::new(key, res).notify()
-                    }
-                }
+                let fd = event.key as RawFd;
+                this.poll_one(event, fd);
             }
 
             Ok(())
@@ -528,10 +648,9 @@ impl AsRawFd for Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        for fd in self.registry.keys() {
-            unsafe {
-                let fd = BorrowedFd::borrow_raw(*fd);
-                self.poller().delete(fd).ok();
+        for (fd, queue) in &self.registry {
+            if queue.armed.is_some() {
+                self.forget(*fd);
             }
         }
     }

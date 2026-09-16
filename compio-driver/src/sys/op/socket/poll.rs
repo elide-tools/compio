@@ -66,6 +66,13 @@ unsafe impl OpCode for CloseSocket {
 unsafe impl<S: AsFd> OpCode for Accept<S> {
     type Control = ();
 
+    fn interest_hint(&mut self, _: &mut Self::Control) -> Option<WaitArg> {
+        Some(WaitArg {
+            fd: self.fd.as_fd().as_raw_fd(),
+            interest: Readable,
+        })
+    }
+
     fn pre_submit(&mut self, _: &mut Self::Control) -> io::Result<Decision> {
         decide(self.fd.as_fd().as_raw_fd(), Readable, || self.call())
     }
@@ -81,6 +88,13 @@ unsafe impl<S: AsFd> OpCode for Accept<S> {
 
 unsafe impl<S: AsFd> OpCode for Connect<S> {
     type Control = ();
+
+    fn interest_hint(&mut self, _: &mut Self::Control) -> Option<WaitArg> {
+        Some(WaitArg {
+            fd: self.fd.as_fd().as_raw_fd(),
+            interest: Writable,
+        })
+    }
 
     fn pre_submit(&mut self, _: &mut Self::Control) -> io::Result<Decision> {
         decide(self.fd.as_fd().as_raw_fd(), Writable, || self.call())
@@ -99,6 +113,17 @@ unsafe impl<S: AsFd> OpCode for Connect<S> {
 unsafe impl<T: IoBufMut, S: AsFd> OpCode for Recv<T, S> {
     type Control = ();
 
+    fn interest_hint(&mut self, _: &mut Self::Control) -> Option<WaitArg> {
+        // A zero-length receive completes without readiness, so it must keep its attempt.
+        if self.buffer.buf_capacity() == 0 {
+            return None;
+        }
+        Some(WaitArg {
+            fd: self.fd.as_fd().as_raw_fd(),
+            interest: Readable,
+        })
+    }
+
     fn pre_submit(&mut self, _: &mut Self::Control) -> io::Result<Decision> {
         decide(self.fd.as_fd().as_raw_fd(), Readable, || self.call())
     }
@@ -114,6 +139,17 @@ unsafe impl<T: IoBufMut, S: AsFd> OpCode for Recv<T, S> {
 
 unsafe impl<T: IoBuf, S: AsFd> OpCode for Send<T, S> {
     type Control = ();
+
+    fn interest_hint(&mut self, _: &mut Self::Control) -> Option<WaitArg> {
+        // A zero-length send completes without readiness, so it must keep its attempt.
+        if self.buffer.buf_len() == 0 {
+            return None;
+        }
+        Some(WaitArg {
+            fd: self.fd.as_fd().as_raw_fd(),
+            interest: Writable,
+        })
+    }
 
     fn pre_submit(&mut self, _: &mut Self::Control) -> io::Result<Decision> {
         decide(self.fd.as_fd().as_raw_fd(), Writable, || self.call())
