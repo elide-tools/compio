@@ -122,8 +122,11 @@ pub(crate) trait IoBufMutExt: IoBufMut {
 impl<T: IoBufMut + ?Sized> IoBufMutExt for T {}
 
 pub(crate) trait IoVectoredBufExt: IoVectoredBuf {
-    /// Convert a pinned [`IoVectoredBuf`] into a vector of [`SysSlice`]s.
-    fn sys_slices(&self) -> Vec<SysSlice> {
+    /// Collect a pinned [`IoVectoredBuf`] into a container of [`SysSlice`]s.
+    ///
+    /// The container is chosen by the control that stores it, so a control with
+    /// inline capacity submits without allocating.
+    fn sys_slices<B: FromIterator<SysSlice>>(&self) -> B {
         self.iter_slice().map(SysSlice::from_slice).collect()
     }
 }
@@ -131,8 +134,8 @@ pub(crate) trait IoVectoredBufExt: IoVectoredBuf {
 impl<T: IoVectoredBuf + ?Sized> IoVectoredBufExt for T {}
 
 pub(crate) trait IoVectoredBufMutExt: IoVectoredBufMut {
-    /// Convert a pinned [`IoVectoredBufMut`] into a vector of [`SysSlice`]s.
-    fn sys_slices_mut(&mut self) -> Vec<SysSlice> {
+    /// Collect a pinned [`IoVectoredBufMut`] into a container of [`SysSlice`]s.
+    fn sys_slices_mut<B: FromIterator<SysSlice>>(&mut self) -> B {
         self.iter_uninit_slice()
             .map(SysSlice::from_uninit)
             .collect()

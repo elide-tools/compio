@@ -336,14 +336,14 @@ impl<S> IntoInner for Accept<S> {
 pub struct RecvVectoredControl {
     pub(crate) msg: libc::msghdr,
     #[allow(dead_code)]
-    pub(crate) slices: Vec<SysSlice>,
+    pub(crate) slices: Vectored<SysSlice>,
 }
 
 impl Default for RecvVectoredControl {
     fn default() -> Self {
         Self {
             msg: unsafe { std::mem::zeroed() },
-            slices: Vec::new(),
+            slices: Vectored::new(),
         }
     }
 }
@@ -360,14 +360,14 @@ impl<T: IoVectoredBufMut, S> RecvVectored<T, S> {
 pub struct SendVectoredControl {
     pub(crate) msg: libc::msghdr,
     #[allow(dead_code)]
-    pub(crate) slices: Vec<SysSlice>,
+    pub(crate) slices: Vectored<SysSlice>,
 }
 
 impl Default for SendVectoredControl {
     fn default() -> Self {
         Self {
             msg: unsafe { std::mem::zeroed() },
-            slices: Vec::new(),
+            slices: Vectored::new(),
         }
     }
 }
@@ -413,7 +413,7 @@ impl Default for SendMsgControl {
 
 impl<T: IoVectoredBuf, C: IoBuf, S> SendMsg<T, C, S> {
     pub(crate) fn init_control(&mut self, ctrl: &mut SendMsgControl) {
-        ctrl.slices = self.buffer.sys_slices().into();
+        ctrl.slices = self.buffer.sys_slices();
         match self.addr.as_ref() {
             Some(addr) => {
                 ctrl.msg.msg_name = addr.as_ptr() as _;
@@ -449,7 +449,7 @@ impl Default for RecvMsgControl {
 
 impl<T: IoVectoredBufMut, C: IoBufMut, S> RecvMsg<T, C, S> {
     pub(crate) fn init_control(&mut self, ctrl: &mut RecvMsgControl) {
-        ctrl.slices = Multi::from_vec(self.buffer.sys_slices_mut());
+        ctrl.slices = self.buffer.sys_slices_mut();
         ctrl.msg.msg_name = &raw mut self.header.addr as _;
         ctrl.msg.msg_namelen = self.header.addr.size_of() as _;
         ctrl.msg.msg_iov = ctrl.slices.as_mut_ptr() as _;

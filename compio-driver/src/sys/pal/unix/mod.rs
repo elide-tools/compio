@@ -17,6 +17,13 @@ pub mod reexport {}
 /// One item in local or more items on heap.
 pub type Multi<T> = SmallVec<[T; 1]>;
 
+/// Up to four items in local or more items on heap.
+///
+/// Storage for a scatter/gather list, which lives inside the operation's own
+/// allocation: the common vectored shapes (a header plus a body, a short run of
+/// frames) then submit without a second one.
+pub type Vectored<T> = SmallVec<[T; 4]>;
+
 /// The interest to poll a file descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interest {

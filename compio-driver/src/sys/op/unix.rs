@@ -74,7 +74,7 @@ impl<S: AsFd> TruncateFile<S> {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct VectoredControl {
-    pub(crate) slices: Vec<SysSlice>,
+    pub(crate) slices: Vectored<SysSlice>,
 }
 
 /// Read a file at specified position into vectored buffer.
