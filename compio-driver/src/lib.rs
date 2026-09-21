@@ -350,6 +350,102 @@ impl Proactor {
         self.driver.waker()
     }
 
+    /// Initialize a bounded owner completion lane on this proactor's ring.
+    /// Requires NODROP. Call once before submitting owner operations; size for
+    /// receive buffers, sends, accepts and control completions together.
+    #[cfg(io_uring)]
+    pub fn owner_init(&mut self, capacity: usize) -> io::Result<()> {
+        self.owner_driver()?.owner_init(capacity)
+    }
+
+    /// Submit an owner SQE without allocating a Key or waking a task.
+    /// `token` must be less than `u64::MAX >> 1`; SQ exhaustion returns
+    /// WouldBlock. SQE user_data is replaced with `(token << 1) | 1`.
+    /// Cancellation targeting an owner token must use that encoded value.
+    ///
+    /// # Safety
+    /// Retain all referenced memory, descriptors, registrations and buffers
+    /// until the target's terminal CQE (without MORE), including after
+    /// cancellation. A cancel CQE alone does not prove target completion.
+    /// Do not use CQE_SKIP_SUCCESS, zero-copy operations with notification
+    /// CQEs, or manipulate generic Key identities. Process selected buffers
+    /// and accepted descriptors in every CQE, including terminal/error
+    /// CQEs. Drain all operations before dropping the proactor;
+    /// if that fails, leak referenced resources rather than freeing kernel
+    /// memory.
+    #[cfg(io_uring)]
+    pub unsafe fn owner_push(
+        &mut self,
+        entry: io_uring::squeue::Entry,
+        token: u64,
+    ) -> io::Result<()> {
+        unsafe { self.owner_driver()?.owner_push(entry, token) }
+    }
+
+    /// Append up to `limit` pending completions to `out`. Reserve output
+    /// capacity before calling to avoid allocations. Call owner_progress to
+    /// refill the lane.
+    #[cfg(io_uring)]
+    pub fn owner_drain(&mut self, out: &mut Vec<OwnerCompletion>, limit: usize) -> usize {
+        self.driver
+            .as_iour_mut()
+            .map_or(0, |d| d.owner_drain(out, limit))
+    }
+
+    /// Submit queued SQEs and drive GETEVENTS without blocking, including
+    /// NODROP overflow and deferred task work. Queue pressure never
+    /// discards a CQE.
+    #[cfg(io_uring)]
+    pub fn owner_progress(&mut self) -> io::Result<()> {
+        self.owner_driver()?.owner_progress()
+    }
+
+    /// Register an empty fixed-file table for owner operations.
+    #[cfg(io_uring)]
+    pub fn owner_register_files_sparse(&mut self, n: u32) -> io::Result<()> {
+        self.owner_driver()?.owner_register_files_sparse(n)
+    }
+
+    /// Replace entries in the fixed-file table, returning the number updated.
+    #[cfg(io_uring)]
+    pub fn owner_update_files(&mut self, offset: u32, fds: &[RawFd]) -> io::Result<usize> {
+        self.owner_driver()?.owner_update_files(offset, fds)
+    }
+
+    /// Register an externally allocated provided-buffer ring.
+    ///
+    /// # Safety
+    /// `addr` must point to a correctly aligned and initialized ring of
+    /// `entries` buffers, following the io_uring buffer-ring ABI. Keep the
+    /// ring and buffers alive through every selecting request's terminal
+    /// CQE and successful unregistration. Publish/reuse buffer entries only
+    /// after consuming their CQEs.
+    #[cfg(io_uring)]
+    pub unsafe fn owner_register_buf_ring(
+        &mut self,
+        addr: u64,
+        entries: u16,
+        group: u16,
+    ) -> io::Result<()> {
+        unsafe {
+            self.owner_driver()?
+                .owner_register_buf_ring(addr, entries, group)
+        }
+    }
+
+    /// Unregister an owner buffer ring after all selecting requests terminated.
+    #[cfg(io_uring)]
+    pub fn owner_unregister_buf_ring(&mut self, group: u16) -> io::Result<()> {
+        self.owner_driver()?.owner_unregister_buf_ring(group)
+    }
+
+    #[cfg(io_uring)]
+    fn owner_driver(&mut self) -> io::Result<&mut sys::OwnerDriver> {
+        self.driver.as_iour_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "owner lane requires io-uring")
+        })
+    }
+
     /// Register file descriptors for fixed-file operations with io_uring.
     ///
     /// This only works on `io_uring` driver. It will return an [`Unsupported`]
@@ -895,4 +991,20 @@ impl<T, B> ErrorExt for BufResult<T, B> {
     fn as_io_error(&self) -> Option<&io::Error> {
         self.0.as_io_error()
     }
+}
+
+/// io_uring types used by the owner lane.
+#[cfg(io_uring)]
+pub use io_uring as uring;
+
+/// A raw owner completion. `flags` preserves MORE and selected-buffer metadata.
+#[cfg(io_uring)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerCompletion {
+    /// Caller token, decoded from the disjoint owner identity domain.
+    pub token: u64,
+    /// Kernel result (negative errno on failure).
+    pub result: i32,
+    /// Unmodified CQE flags.
+    pub flags: u32,
 }

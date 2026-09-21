@@ -1,6 +1,10 @@
 use std::{
-    collections::HashSet, marker::PhantomData, mem::ManuallyDrop, panic::AssertUnwindSafe,
-    sync::Arc, time::Duration,
+    collections::{HashSet, VecDeque},
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::Duration,
 };
 
 use crate::sys::{extra::IourExtra, prelude::*};
@@ -58,10 +62,7 @@ bitflags::bitflags! {
 
 /// Low-level driver of io-uring.
 pub(crate) struct Driver {
-    // Wrapped in `ManuallyDrop` so that `Drop` can close the ring *before*
-    // releasing the in-flight keys. Closing the io_uring fd makes the kernel
-    // wait for or cancel any in-flight ops, which guarantees the kernel is no
-    // longer reading from or writing to the buffers owned by those keys.
+    // Ring close is not proof that asynchronous kernel teardown has finished.
     inner: ManuallyDrop<IoUring<SEntry, CEntry>>,
     notifier: Notifier,
     pool: AsyncifyPool,
@@ -70,6 +71,8 @@ pub(crate) struct Driver {
     flags: DriverFlags,
     /// Keys leaked via `into_raw()` into io_uring user_data, freed on drop.
     in_flight: HashSet<usize>,
+    owner_completed: VecDeque<crate::OwnerCompletion>,
+    owner_capacity: usize,
     _p: PhantomData<ErasedKey>,
 }
 
@@ -141,6 +144,8 @@ impl Driver {
             pool: builder.create_or_get_thread_pool(),
             flags,
             in_flight: HashSet::new(),
+            owner_completed: VecDeque::new(),
+            owner_capacity: 0,
             _p: PhantomData,
         })
     }
@@ -157,6 +162,107 @@ impl Driver {
     #[allow(dead_code)]
     pub fn as_iour_mut(&mut self) -> Option<&mut Self> {
         Some(self)
+    }
+
+    pub fn owner_init(&mut self, capacity: usize) -> io::Result<()> {
+        if !self.inner.params().is_feature_nodrop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "owner lane requires IORING_FEAT_NODROP",
+            ));
+        }
+        if capacity == 0 || self.owner_capacity != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid or already initialized owner capacity",
+            ));
+        }
+        self.owner_completed = VecDeque::with_capacity(capacity);
+        self.owner_capacity = capacity;
+        Ok(())
+    }
+
+    pub unsafe fn owner_push(
+        &mut self,
+        entry: io_uring::squeue::Entry,
+        token: u64,
+    ) -> io::Result<()> {
+        if self.owner_capacity == 0 || token >= (u64::MAX >> 1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owner lane uninitialized or token reserved",
+            ));
+        }
+        #[allow(clippy::useless_conversion)]
+        let entry: SEntry = entry.user_data((token << 1) | 1).into();
+        let mut sq = self.inner.submission();
+        unsafe { sq.push(&entry) }.map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        sq.sync();
+        Ok(())
+    }
+
+    pub fn owner_drain(&mut self, out: &mut Vec<crate::OwnerCompletion>, limit: usize) -> usize {
+        let n = limit.min(self.owner_completed.len());
+        out.extend(self.owner_completed.drain(..n));
+        n
+    }
+
+    pub fn owner_progress(&mut self) -> io::Result<()> {
+        self.poll_entries();
+        // GETEVENTS is required even without submissions to flush NODROP
+        // overflow and drive deferred task work. Never wait for an
+        // event here.
+        let n = self.inner.submission().len() as u32;
+        let result = unsafe {
+            self.inner
+                .submitter()
+                .enter::<libc::sigset_t>(n, 0, EnterFlags::GETEVENTS.bits(), None)
+        };
+        self.poll_entries();
+        if self.inner.completion().overflow() != 0 {
+            return Err(io::Error::other(
+                "io-uring lost CQEs; retain all in-flight owner resources",
+            ));
+        }
+        match result {
+            Ok(_) => Ok(()),
+            // CQ pressure and interrupted progress are retryable. The owner
+            // drains its bounded lane before the next progress attempt.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EBUSY | libc::EAGAIN | libc::EINTR)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn owner_register_files_sparse(&self, n: u32) -> io::Result<()> {
+        self.inner.submitter().register_files_sparse(n)
+    }
+
+    pub fn owner_update_files(&self, offset: u32, fds: &[RawFd]) -> io::Result<usize> {
+        self.inner.submitter().register_files_update(offset, fds)
+    }
+
+    pub unsafe fn owner_register_buf_ring(
+        &self,
+        addr: u64,
+        entries: u16,
+        group: u16,
+    ) -> io::Result<()> {
+        unsafe {
+            self.inner
+                .submitter()
+                .register_buf_ring_with_flags(addr, entries, group, 0)
+        }
+    }
+
+    pub fn owner_unregister_buf_ring(&self, group: u16) -> io::Result<()> {
+        self.inner.submitter().unregister_buf_ring(group)
     }
 
     pub fn register_files(&self, fds: &[RawFd]) -> io::Result<()> {
@@ -185,8 +291,8 @@ impl Driver {
     fn submit_auto(&mut self, timeout: Option<Duration>, need_wait: bool) -> io::Result<()> {
         instrument!(compio_log::Level::TRACE, "submit_auto", ?timeout);
 
-        // when taskrun is true, there are completed cqes wait to handle, no need to
-        // block the submit
+        // when taskrun is true, there are completed cqes wait to handle, no
+        // need to block the submit
         let want_sqe = if !need_wait || self.inner.submission().taskrun() {
             0
         } else {
@@ -194,8 +300,8 @@ impl Driver {
         };
 
         // Only a wait that can actually sleep is charged as iowait; a zero
-        // timeout (the drain calls from `push_raw`/`flush`) returns immediately,
-        // so it keeps the plain combined path.
+        // timeout (the drain calls from `push_raw`/`flush`) returns
+        // immediately, so it keeps the plain combined path.
         //
         // On the sleeping path, opt out of iowait accounting (see
         // `DriverFlags::NO_IOWAIT`) by carrying NO_IOWAIT on the same
@@ -245,7 +351,8 @@ impl Driver {
         want_sqe: usize,
         timeout: Option<Duration>,
     ) -> io::Result<usize> {
-        // Publish the SQ tail and read how many staged SQEs to submit this call.
+        // Publish the SQ tail and read how many staged SQEs to submit this
+        // call.
         let to_submit = self.inner.submission().len() as u32;
         let submitter = self.inner.submitter();
         if let Some(duration) = timeout {
@@ -275,9 +382,10 @@ impl Driver {
     }
 
     fn poll_entries(&mut self) -> bool {
-        let cqueue = self.inner.completion();
+        let mut cqueue = self.inner.completion();
         let has_entry = !cqueue.is_empty();
-        for entry in cqueue {
+        while self.owner_capacity == 0 || self.owner_completed.len() < self.owner_capacity {
+            let Some(entry) = cqueue.next() else { break };
             match entry.user_data() {
                 Self::CANCEL => {}
                 Self::NOTIFY => {
@@ -288,6 +396,13 @@ impl Driver {
                     if let Err(e) = self.notifier.clear() {
                         error!("failed to clear notifier: {e:?}");
                     }
+                }
+                token if token & 1 != 0 => {
+                    self.owner_completed.push_back(crate::OwnerCompletion {
+                        token: token >> 1,
+                        result: entry.result(),
+                        flags: entry.flags(),
+                    });
                 }
                 key => {
                     let flags = entry.flags();
@@ -342,6 +457,7 @@ impl Driver {
 
     fn push_raw_with_key(&mut self, entry: SEntry, key: ErasedKey) -> io::Result<()> {
         let user_data = key.as_raw();
+        assert_eq!(user_data & 1, 0, "operation keys must be aligned");
         let entry = entry.user_data(user_data as _);
         self.push_raw(entry)?; // if push failed, do not leak the key. Drop it upon return.
         self.in_flight.insert(user_data);
@@ -368,12 +484,20 @@ impl Driver {
                             ) => {}
                         Err(e) => return Err(e),
                     }
-                    // If the CQEs are consumed here, we should make the driver aware of it. We
-                    // should not mask `awake` here, otherwise the driver may wait for the next
+                    // If the CQEs are consumed here, we should make the driver
+                    // aware of it. We should not mask
+                    // `awake` here, otherwise the driver may wait for the next
                     // event indefinitely.
                     //
-                    // Anyway it is not a hot path, so we can afford an extra `write` syscall here.
+                    // Anyway it is not a hot path, so we can afford an extra
+                    // `write` syscall here.
                     self.poll_entries();
+                    if self.owner_capacity != 0
+                        && self.owner_completed.len() == self.owner_capacity
+                        && self.inner.submission().is_full()
+                    {
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
                 }
             }
         }
@@ -420,7 +544,8 @@ impl Driver {
     fn push_blocking(&mut self, key: ErasedKey) {
         let waker = self.waker();
         let completed = self.completed_tx.clone();
-        // SAFETY: we're submitting into the driver, so it's safe to freeze here.
+        // SAFETY: we're submitting into the driver, so it's safe to freeze
+        // here.
         let mut key = unsafe { key.freeze() };
         let mut closure = move || {
             let res = catch_unwind_io(AssertUnwindSafe(|| key.as_mut().carrier.call_blocking()));
@@ -435,7 +560,8 @@ impl Driver {
 
     pub fn flush(&mut self) -> bool {
         let succeed = self.submit_auto(Some(Duration::ZERO), false).is_ok();
-        // If submission failed, return true to let the driver wake up immediately.
+        // If submission failed, return true to let the driver wake up
+        // immediately.
         !succeed | self.notifier.reset()
     }
 
@@ -448,7 +574,7 @@ impl Driver {
 
         trace!("start polling");
 
-        let need_wait = !self.notifier.reset();
+        let need_wait = !self.notifier.reset() && self.owner_completed.is_empty();
 
         if self.flags.contains(DriverFlags::NEED_PUSH_NOTIFIER) {
             #[allow(clippy::useless_conversion)]
@@ -491,33 +617,24 @@ impl AsRawFd for Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        // Drain completed CQEs first to avoid double-free.
-        let mut cqueue = self.inner.completion();
-        cqueue.sync();
-        for entry in cqueue {
-            match entry.user_data() {
-                Self::CANCEL | Self::NOTIFY => {}
-                key => {
-                    self.in_flight.remove(&(key as usize));
-                    drop(unsafe { ErasedKey::from_raw(key as _) });
-                }
-            }
-        }
-
-        // Close the io_uring ring *before* freeing the remaining in-flight
-        // keys. Closing the ring fd makes the kernel wait for in-flight ops to
-        // finish or be cancelled, so it will no longer read from or write to
-        // the buffers owned by those keys. Without this, the kernel could
-        // touch a freed (and potentially recycled) heap allocation, which
-        // corrupts the glibc heap and typically surfaces as
-        // `malloc_consolidate(): unaligned fastbin chunk detected` /
-        // `corrupted double-linked list` during thread shutdown.
+        // Dispatch MORE through the carrier so accepted descriptors and
+        // selected buffers keep their normal ownership. Only terminal
+        // CQEs consume keys.
+        self.poll_entries();
+        // Submit staged operations before cancelling: sync cancellation does
+        // not cover SQEs the kernel has not consumed. No timeout proves
+        // completion.
+        let _ = self.inner.submit();
+        let _ = self
+            .inner
+            .submitter()
+            .register_sync_cancel(None, io_uring::types::CancelBuilder::any());
+        self.poll_entries();
         unsafe { ManuallyDrop::drop(&mut self.inner) };
-
-        // Free remaining in-flight keys. Safe now that the kernel is done.
-        for user_data in self.in_flight.drain() {
-            drop(unsafe { ErasedKey::from_raw(user_data) });
-        }
+        // Kernel ring teardown can run asynchronously. Keys without an observed
+        // terminal CQE deliberately remain leaked, including on cancellation
+        // failure or owner-lane backpressure. Never infer safety from close().
+        // Raw owners must drain their terminal CQEs before freeing resources.
     }
 }
 

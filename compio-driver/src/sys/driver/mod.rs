@@ -8,11 +8,11 @@ cfg_select! {
     fusion => {
         mod fusion;
         mod poll;
-        mod iour;
+        pub(crate) mod iour;
         pub use fusion::*;
     }
     io_uring => {
-        mod iour;
+        pub(crate) mod iour;
         pub use iour::*;
     }
     stub => {

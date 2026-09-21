@@ -61,3 +61,6 @@ mod prelude {
         syscall,
     };
 }
+
+#[cfg(io_uring)]
+pub(crate) use driver::iour::Driver as OwnerDriver;
