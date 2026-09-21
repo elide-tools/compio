@@ -118,3 +118,123 @@ fn cq_overflow_and_sq_pressure_are_lossless() {
         }
     }
 }
+
+#[test]
+fn pool_is_retained_when_owner_pressure_hides_generic_terminal() {
+    use std::{
+        mem::MaybeUninit,
+        ptr::NonNull,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use compio_driver::{BoxAllocator, BufferAllocator, SharedFd, op::RecvMulti};
+    static FREED: AtomicUsize = AtomicUsize::new(0);
+    struct Counted;
+    impl BufferAllocator for Counted {
+        fn allocate(len: u32) -> NonNull<MaybeUninit<u8>> {
+            BoxAllocator::allocate(len)
+        }
+
+        unsafe fn deallocate(ptr: NonNull<MaybeUninit<u8>>, len: u32) {
+            FREED.fetch_add(1, Ordering::SeqCst);
+            unsafe { BoxAllocator::deallocate(ptr, len) };
+        }
+    }
+    let mut p = Proactor::builder()
+        .buffer_pool_allocator::<Counted>()
+        .buffer_pool_buffer_len(64)
+        .build()
+        .unwrap();
+    p.owner_init(1).unwrap();
+    let pool = p.buffer_pool().unwrap();
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    unsafe { p.owner_push(opcode::Nop::new().build(), 1) }.unwrap();
+    let key = p.push(
+        RecvMulti::new(
+            SharedFd::new(reader),
+            &pool,
+            64,
+            rustix::net::RecvFlags::empty(),
+        )
+        .unwrap(),
+    );
+    p.owner_progress().unwrap();
+    drop(p);
+    drop(key);
+    assert_eq!(FREED.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn generic_cancel_survives_full_owner_sq() {
+    use compio_driver::{SharedFd, op::Recv};
+    let mut p = Proactor::builder().capacity(8).build().unwrap();
+    p.owner_init(16).unwrap();
+    let _ = p.poll(Some(Duration::ZERO));
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = SharedFd::new(reader);
+    let raw_fd = reader.as_raw_fd();
+    let PushEntry::Pending(mut key) = p.push(Recv::new(
+        reader.clone(),
+        vec![0; 8],
+        rustix::net::RecvFlags::empty(),
+    )) else {
+        panic!("receive must pend")
+    };
+    let mut submitted = 0;
+    loop {
+        match unsafe {
+            p.owner_push(
+                opcode::PollAdd::new(Fd(raw_fd), libc::POLLIN as _).build(),
+                submitted,
+            )
+        } {
+            Ok(()) => submitted += 1,
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+    }
+    assert_eq!(submitted, 7);
+    assert!(p.cancel(key.clone()).is_none());
+    // Pending cancellation must prevent sleeping behind an SQ of idle
+    // operations.
+    p.poll(Some(Duration::from_millis(20))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut batch = Vec::with_capacity(16);
+    loop {
+        assert!(Instant::now() < deadline);
+        p.owner_progress().unwrap();
+        batch.clear();
+        p.owner_drain(&mut batch, 16);
+        match p.pop(key) {
+            PushEntry::Pending(k) => key = k,
+            PushEntry::Ready(result) => {
+                assert_eq!(result.0.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+                break;
+            }
+        }
+    }
+    for token in 0..submitted {
+        unsafe {
+            p.owner_push(
+                opcode::AsyncCancel::new((token << 1) | 1).build(),
+                100 + token,
+            )
+        }
+        .unwrap();
+    }
+    let mut terminals = 0;
+    while terminals < submitted {
+        assert!(Instant::now() < deadline);
+        p.owner_progress().unwrap();
+        batch.clear();
+        p.owner_drain(&mut batch, 16);
+        for c in &batch {
+            if c.token < submitted {
+                assert_eq!(c.result, -libc::ECANCELED);
+                terminals += 1;
+            }
+        }
+    }
+}

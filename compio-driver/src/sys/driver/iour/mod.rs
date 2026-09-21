@@ -69,8 +69,10 @@ pub(crate) struct Driver {
     completed_tx: Sender<Entry>,
     completed_rx: Receiver<Entry>,
     flags: DriverFlags,
-    /// Keys leaked via `into_raw()` into io_uring user_data, freed on drop.
+    /// Keys leaked via `into_raw()` into io_uring user_data; terminal CQEs
+    /// release them.
     in_flight: HashSet<usize>,
+    pending_cancel: HashSet<usize>,
     owner_completed: VecDeque<crate::OwnerCompletion>,
     owner_capacity: usize,
     _p: PhantomData<ErasedKey>,
@@ -144,6 +146,7 @@ impl Driver {
             pool: builder.create_or_get_thread_pool(),
             flags,
             in_flight: HashSet::new(),
+            pending_cancel: HashSet::new(),
             owner_completed: VecDeque::new(),
             owner_capacity: 0,
             _p: PhantomData,
@@ -193,6 +196,7 @@ impl Driver {
                 "owner lane uninitialized or token reserved",
             ));
         }
+        self.push_pending_cancels();
         #[allow(clippy::useless_conversion)]
         let entry: SEntry = entry.user_data((token << 1) | 1).into();
         let mut sq = self.inner.submission();
@@ -209,6 +213,7 @@ impl Driver {
 
     pub fn owner_progress(&mut self) -> io::Result<()> {
         self.poll_entries();
+        self.push_pending_cancels();
         // GETEVENTS is required even without submissions to flush NODROP
         // overflow and drive deferred task work. Never wait for an
         // event here.
@@ -290,14 +295,16 @@ impl Driver {
     // Auto means that it choose to wait or not automatically.
     fn submit_auto(&mut self, timeout: Option<Duration>, need_wait: bool) -> io::Result<()> {
         instrument!(compio_log::Level::TRACE, "submit_auto", ?timeout);
+        self.push_pending_cancels();
 
         // when taskrun is true, there are completed cqes wait to handle, no
         // need to block the submit
-        let want_sqe = if !need_wait || self.inner.submission().taskrun() {
-            0
-        } else {
-            1
-        };
+        let want_sqe =
+            if !need_wait || !self.pending_cancel.is_empty() || self.inner.submission().taskrun() {
+                0
+            } else {
+                1
+            };
 
         // Only a wait that can actually sleep is charged as iowait; a zero
         // timeout (the drain calls from `push_raw`/`flush`) returns
@@ -418,6 +425,7 @@ impl Driver {
                         key.wake_by_ref();
                     } else {
                         self.in_flight.remove(&(key as usize));
+                        self.pending_cancel.remove(&(key as usize));
                         create_entry(entry).notify()
                     }
                 }
@@ -437,21 +445,25 @@ impl Driver {
     pub fn cancel(&mut self, key: ErasedKey) {
         instrument!(compio_log::Level::TRACE, "cancel", ?key);
         trace!("cancel RawOp");
-        unsafe {
+        let raw = key.as_raw();
+        if self.in_flight.contains(&raw) {
+            // Deduplicated and bounded by the generic operations already alive.
+            self.pending_cancel.insert(raw);
+            self.push_pending_cancels();
+        }
+    }
+
+    fn push_pending_cancels(&mut self) {
+        while let Some(&raw) = self.pending_cancel.iter().next() {
             #[allow(clippy::useless_conversion)]
-            if self
-                .inner
-                .submission()
-                .push(
-                    &AsyncCancel::new(key.as_raw() as _)
-                        .build()
-                        .user_data(Self::CANCEL)
-                        .into(),
-                )
-                .is_err()
-            {
-                warn!("could not push AsyncCancel entry");
+            let entry = AsyncCancel::new(raw as u64)
+                .build()
+                .user_data(Self::CANCEL)
+                .into();
+            if unsafe { self.inner.submission().push(&entry) }.is_err() {
+                break;
             }
+            self.pending_cancel.remove(&raw);
         }
     }
 
@@ -467,6 +479,7 @@ impl Driver {
 
     fn push_raw(&mut self, entry: SEntry) -> io::Result<()> {
         loop {
+            self.push_pending_cancels();
             let mut squeue = self.inner.submission();
             match unsafe { squeue.push(&entry) } {
                 Ok(()) => {
@@ -601,6 +614,24 @@ impl Driver {
         self.notifier.waker()
     }
 
+    /// Prove generic operations are terminal before releasing their pool.
+    pub(crate) fn quiesce(&mut self) -> bool {
+        // Dispatch MORE through the carrier so accepted descriptors and
+        // selected buffers keep their normal ownership. Only terminal
+        // CQEs consume keys.
+        self.poll_entries();
+        // Submit staged operations before cancelling: sync cancellation does
+        // not cover SQEs the kernel has not consumed. A zero timeout bounds
+        // shutdown; only observed terminal CQEs authorize releasing storage.
+        let _ = self.inner.submit();
+        let _ = self
+            .inner
+            .submitter()
+            .register_sync_cancel(Some(Timespec::new()), io_uring::types::CancelBuilder::any());
+        self.poll_entries();
+        self.in_flight.is_empty() && self.inner.completion().overflow() == 0
+    }
+
     pub fn pop_multishot(
         &mut self,
         key: &ErasedKey,
@@ -617,19 +648,7 @@ impl AsRawFd for Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        // Dispatch MORE through the carrier so accepted descriptors and
-        // selected buffers keep their normal ownership. Only terminal
-        // CQEs consume keys.
-        self.poll_entries();
-        // Submit staged operations before cancelling: sync cancellation does
-        // not cover SQEs the kernel has not consumed. No timeout proves
-        // completion.
-        let _ = self.inner.submit();
-        let _ = self
-            .inner
-            .submitter()
-            .register_sync_cancel(None, io_uring::types::CancelBuilder::any());
-        self.poll_entries();
+        self.quiesce();
         unsafe { ManuallyDrop::drop(&mut self.inner) };
         // Kernel ring teardown can run asynchronously. Keys without an observed
         // terminal CQE deliberately remain leaked, including on cancellation
