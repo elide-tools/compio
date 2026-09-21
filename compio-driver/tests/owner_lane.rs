@@ -238,3 +238,42 @@ fn generic_cancel_survives_full_owner_sq() {
         }
     }
 }
+
+#[test]
+fn regular_poll_drives_owner_deferred_work_without_submissions() {
+    use std::io::Write;
+    let mut p = Proactor::builder()
+        .single_issuer(true)
+        .defer_taskrun(true)
+        .taskrun_flag(true)
+        .build()
+        .unwrap();
+    p.owner_init(4).unwrap();
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    unsafe {
+        p.owner_push(
+            opcode::PollAdd::new(Fd(reader.as_raw_fd()), libc::POLLIN as _).build(),
+            9,
+        )
+    }
+    .unwrap();
+    let _ = p.poll(Some(Duration::ZERO));
+    writer.write_all(b"ready").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut batch = Vec::with_capacity(4);
+    loop {
+        assert!(Instant::now() < deadline);
+        match p.poll(Some(Duration::ZERO)) {
+            Ok(()) => {}
+            Err(e) => assert!(matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+            )),
+        }
+        if p.owner_drain(&mut batch, 4) != 0 {
+            break;
+        }
+    }
+    assert_eq!(batch[0].token, 9);
+    assert_ne!(batch[0].result & libc::POLLIN as i32, 0);
+}

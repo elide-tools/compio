@@ -362,8 +362,9 @@ impl Proactor {
     }
 
     /// Initialize a bounded owner completion lane on this proactor's ring.
-    /// Requires NODROP. Call once before submitting owner operations; size for
-    /// receive buffers, sends, accepts and control completions together.
+    /// Requires NODROP and no SQPOLL. Call once before submitting owner
+    /// operations; size for receive buffers, sends, accepts and control
+    /// completions together.
     #[cfg(io_uring)]
     pub fn owner_init(&mut self, capacity: usize) -> io::Result<()> {
         self.owner_driver()?.owner_init(capacity)

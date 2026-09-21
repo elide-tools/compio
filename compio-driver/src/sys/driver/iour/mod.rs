@@ -168,10 +168,10 @@ impl Driver {
     }
 
     pub fn owner_init(&mut self, capacity: usize) -> io::Result<()> {
-        if !self.inner.params().is_feature_nodrop() {
+        if !self.inner.params().is_feature_nodrop() || self.inner.params().is_setup_sqpoll() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "owner lane requires IORING_FEAT_NODROP",
+                "owner lane requires IORING_FEAT_NODROP without SQPOLL",
             ));
         }
         if capacity == 0 || self.owner_capacity != 0 {
@@ -224,11 +224,7 @@ impl Driver {
                 .enter::<libc::sigset_t>(n, 0, EnterFlags::GETEVENTS.bits(), None)
         };
         self.poll_entries();
-        if self.inner.completion().overflow() != 0 {
-            return Err(io::Error::other(
-                "io-uring lost CQEs; retain all in-flight owner resources",
-            ));
-        }
+        self.check_owner_completions()?;
         match result {
             Ok(_) => Ok(()),
             // CQ pressure and interrupted progress are retryable. The owner
@@ -243,6 +239,15 @@ impl Driver {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn check_owner_completions(&mut self) -> io::Result<()> {
+        if self.owner_capacity != 0 && self.inner.completion().overflow() != 0 {
+            return Err(io::Error::other(
+                "io-uring lost CQEs; retain all in-flight owner resources",
+            ));
+        }
+        Ok(())
     }
 
     pub fn owner_register_files_sparse(&self, n: u32) -> io::Result<()> {
@@ -314,8 +319,9 @@ impl Driver {
         // `DriverFlags::NO_IOWAIT`) by carrying NO_IOWAIT on the same
         // submit-and-wait `enter`.
         let can_block = want_sqe > 0 && timeout != Some(Duration::ZERO);
-        let res = if self.flags.contains(DriverFlags::NO_IOWAIT) && can_block {
-            self.submit_and_wait_no_iowait(want_sqe, timeout)
+        let no_iowait = self.flags.contains(DriverFlags::NO_IOWAIT) && can_block;
+        let res = if self.owner_capacity != 0 || no_iowait {
+            self.submit_and_wait_explicit(want_sqe, timeout, no_iowait)
         } else {
             self.submit_and_wait(want_sqe, timeout)
         };
@@ -348,29 +354,29 @@ impl Driver {
         }
     }
 
-    /// Submit the pending SQEs and wait on completions in a single `enter`
-    /// carrying `IORING_ENTER_NO_IOWAIT` so the wait is not charged as iowait
-    /// (see `DriverFlags::NO_IOWAIT`). The crate's `submit_*` helpers cannot
-    /// add custom `EnterFlags`, so this drops to the raw `enter` with
-    /// `to_submit = sq_len()` instead of the combined `submit_and_wait`.
-    fn submit_and_wait_no_iowait(
+    /// Drive GETEVENTS on every owner turn, including zero-timeout/empty-SQ
+    /// turns, without a second enter syscall. Sleeping waits can opt out of
+    /// iowait.
+    fn submit_and_wait_explicit(
         &mut self,
         want_sqe: usize,
         timeout: Option<Duration>,
+        no_iowait: bool,
     ) -> io::Result<usize> {
         // Publish the SQ tail and read how many staged SQEs to submit this
         // call.
         let to_submit = self.inner.submission().len() as u32;
         let submitter = self.inner.submitter();
+        let mut flags = EnterFlags::GETEVENTS;
+        flags.set(EnterFlags::NO_IOWAIT, no_iowait);
         if let Some(duration) = timeout {
             let timespec = timespec(duration);
             let args = SubmitArgs::new().timespec(&timespec);
-            let flags = EnterFlags::EXT_ARG | EnterFlags::GETEVENTS | EnterFlags::NO_IOWAIT;
+            flags.insert(EnterFlags::EXT_ARG);
             // SAFETY: `args` outlives the call; the SQ is synced and holds
             // `to_submit` valid SQEs.
             unsafe { submitter.enter(to_submit, want_sqe as u32, flags.bits(), Some(&args)) }
         } else {
-            let flags = EnterFlags::GETEVENTS | EnterFlags::NO_IOWAIT;
             // SAFETY: the SQ is synced and holds `to_submit` valid SQEs; no arg
             // payload is referenced.
             unsafe {
@@ -581,13 +587,15 @@ impl Driver {
     pub fn poll(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         instrument!(compio_log::Level::TRACE, "poll", ?timeout);
 
-        if self.poll_blocking() {
+        self.check_owner_completions()?;
+        let blocking = self.poll_blocking();
+        if blocking && self.owner_capacity == 0 {
             return Ok(());
         }
 
         trace!("start polling");
 
-        let need_wait = !self.notifier.reset() && self.owner_completed.is_empty();
+        let need_wait = !blocking && !self.notifier.reset() && self.owner_completed.is_empty();
 
         if self.flags.contains(DriverFlags::NEED_PUSH_NOTIFIER) {
             #[allow(clippy::useless_conversion)]
@@ -607,7 +615,7 @@ impl Driver {
         self.poll_entries();
         self.notifier.set_awake();
 
-        Ok(())
+        self.check_owner_completions()
     }
 
     pub fn waker(&self) -> Waker {
