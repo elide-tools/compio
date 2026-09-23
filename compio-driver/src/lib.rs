@@ -379,12 +379,13 @@ impl Proactor {
     /// Retain all referenced memory, descriptors, registrations and buffers
     /// until the target's terminal CQE (without MORE), including after
     /// cancellation. A cancel CQE alone does not prove target completion.
-    /// Do not use CQE_SKIP_SUCCESS, zero-copy operations with notification
-    /// CQEs, or manipulate generic Key identities. Process selected buffers
-    /// and accepted descriptors in every CQE, including terminal/error
-    /// CQEs. Drain all operations before dropping the proactor;
-    /// if that fails, leak referenced resources rather than freeing kernel
-    /// memory.
+    /// Zero-copy sends retain their payload until the notification CQE when
+    /// the initial CQE has MORE. An initial send result is not buffer release.
+    /// Do not use CQE_SKIP_SUCCESS or manipulate generic Key identities.
+    /// Process selected buffers and accepted descriptors in every CQE,
+    /// including terminal/error CQEs. Drain all operations before dropping
+    /// the proactor; if that fails, leak referenced resources rather than
+    /// freeing kernel memory.
     #[cfg(io_uring)]
     pub unsafe fn owner_push(
         &mut self,
@@ -449,6 +450,13 @@ impl Proactor {
     #[cfg(io_uring)]
     pub fn owner_unregister_buf_ring(&mut self, group: u16) -> io::Result<()> {
         self.owner_driver()?.owner_unregister_buf_ring(group)
+    }
+
+    /// Probe opcode support on this proactor's ring; modifiers still require
+    /// runtime fallback when a particular socket or operation rejects them.
+    #[cfg(io_uring)]
+    pub fn owner_probe(&mut self) -> io::Result<io_uring::Probe> {
+        self.owner_driver()?.owner_probe()
     }
 
     #[cfg(io_uring)]

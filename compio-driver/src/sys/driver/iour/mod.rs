@@ -275,6 +275,12 @@ impl Driver {
         self.inner.submitter().unregister_buf_ring(group)
     }
 
+    pub fn owner_probe(&self) -> io::Result<io_uring::Probe> {
+        let mut probe = io_uring::Probe::new();
+        self.inner.submitter().register_probe(&mut probe)?;
+        Ok(probe)
+    }
+
     pub fn register_files(&self, fds: &[RawFd]) -> io::Result<()> {
         self.inner.submitter().register_files(fds)?;
         Ok(())

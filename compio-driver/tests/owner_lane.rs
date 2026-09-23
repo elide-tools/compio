@@ -13,6 +13,95 @@ use compio_driver::{
 };
 
 #[test]
+fn zero_copy_notifications_survive_a_single_entry_owner_lane() {
+    use std::{
+        io::Read,
+        net::{TcpListener, TcpStream},
+    };
+    for vectored in [false, true] {
+        let mut p = Proactor::new().unwrap();
+        p.owner_init(1).unwrap();
+        let probe = p.owner_probe().unwrap();
+        assert!(probe.is_supported(opcode::Nop::CODE));
+        let code = if vectored {
+            opcode::SendMsgZc::CODE
+        } else {
+            opcode::SendZc::CODE
+        };
+        if !probe.is_supported(code) {
+            continue;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut receiver, _) = listener.accept().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let payload = vec![b'z'; 32768];
+        let reader = std::thread::spawn(move || {
+            let mut bytes = vec![0; 32768];
+            receiver.read_exact(&mut bytes).unwrap();
+            assert!(bytes.iter().all(|byte| *byte == b'z'));
+        });
+        let mut vectors = [libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        }];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = vectors.as_mut_ptr();
+        message.msg_iovlen = vectors.len();
+        let entry = if vectored {
+            opcode::SendMsgZc::new(Fd(sender.as_raw_fd()), &message)
+                .flags(libc::MSG_WAITALL as u32)
+                .build()
+        } else {
+            opcode::SendZc::new(
+                Fd(sender.as_raw_fd()),
+                payload.as_ptr(),
+                payload.len() as u32,
+            )
+            .flags(libc::MSG_WAITALL)
+            .build()
+        };
+        unsafe {
+            p.owner_push(entry, 7).unwrap();
+        }
+        unsafe {
+            p.owner_push(opcode::Nop::new().build(), 8).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut initial, mut notification, mut more, mut nop) = (false, false, false, false);
+        let mut batch = Vec::with_capacity(1);
+        while !initial || (more && !notification) || !nop {
+            assert!(Instant::now() < deadline);
+            p.owner_progress().unwrap();
+            batch.clear();
+            assert!(p.owner_drain(&mut batch, 8) <= 1);
+            for c in &batch {
+                if c.token == 8 {
+                    assert!(!nop);
+                    assert_eq!(c.result, 0);
+                    nop = true;
+                } else {
+                    assert_eq!(c.token, 7);
+                    if cqueue::notif(c.flags) {
+                        assert!(initial && more && !notification);
+                        assert!(!cqueue::more(c.flags));
+                        notification = true;
+                    } else {
+                        assert!(!initial);
+                        assert_eq!(c.result as usize, payload.len());
+                        initial = true;
+                        more = cqueue::more(c.flags);
+                    }
+                }
+            }
+        }
+        reader.join().unwrap();
+    }
+}
+
+#[test]
 fn bounded_lane_preserves_completions_and_generic_keys() {
     let mut p = Proactor::new().unwrap();
     p.owner_init(2).unwrap();
@@ -35,8 +124,12 @@ fn bounded_lane_preserves_completions_and_generic_keys() {
             assert!(seen.insert(c.token));
         }
     }
-    if let PushEntry::Pending(key) = generic {
-        assert!(matches!(p.pop(key), PushEntry::Ready(_)));
+    let mut generic = generic;
+    while let PushEntry::Pending(key) = generic {
+        assert!(Instant::now() < deadline);
+        // Owner NOPs can retire before the independently scheduled file read.
+        p.owner_progress().unwrap();
+        generic = p.pop(key);
     }
 }
 
