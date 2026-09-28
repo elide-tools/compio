@@ -6,9 +6,9 @@ use linux_raw_sys::io_uring::{IORING_ACCEPT_POLL_FIRST, IORING_RECVSEND_POLL_FIR
 #[cfg(not(feature = "once_cell_try"))]
 use once_cell::sync::OnceCell as OnceLock;
 
-pub fn is_op_supported(code: u8) -> bool {
-    static PROBE: OnceLock<io_uring::Probe> = OnceLock::new();
+static PROBE: OnceLock<io_uring::Probe> = OnceLock::new();
 
+pub fn is_op_supported(code: u8) -> bool {
     PROBE
         .get_or_try_init(|| {
             let mut probe = io_uring::Probe::new();
@@ -21,6 +21,19 @@ pub fn is_op_supported(code: u8) -> bool {
         })
         .map(|probe| probe.is_supported(code))
         .unwrap_or_default()
+}
+
+/// Fill the opcode probe from an existing ring, so a transient failure to set
+/// up [`is_op_supported`]'s throwaway ring can't report every opcode
+/// unsupported.
+pub fn seed_probe(submitter: &io_uring::Submitter<'_>) -> std::io::Result<()> {
+    PROBE
+        .get_or_try_init(|| {
+            let mut probe = io_uring::Probe::new();
+            submitter.register_probe(&mut probe)?;
+            std::io::Result::Ok(probe)
+        })
+        .map(|_| ())
 }
 
 /// The kernel version of Linux.
