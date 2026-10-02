@@ -24,9 +24,8 @@ use compio_log::*;
 use windows_sys::Win32::{
     Foundation::{
         ERROR_BAD_COMMAND, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_INCOMPLETE,
-        ERROR_MORE_DATA, ERROR_NETNAME_DELETED, ERROR_NO_DATA, ERROR_PIPE_CONNECTED,
-        ERROR_PIPE_NOT_CONNECTED, FACILITY_NTWIN32, INVALID_HANDLE_VALUE, NTSTATUS,
-        RtlNtStatusToDosError, STATUS_SUCCESS,
+        ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
+        FACILITY_NTWIN32, INVALID_HANDLE_VALUE, NTSTATUS, RtlNtStatusToDosError, STATUS_SUCCESS,
     },
     Storage::FileSystem::SetFileCompletionNotificationModes,
     System::{
@@ -136,19 +135,15 @@ impl CompletionPort {
         Ok(recv_count as _)
     }
 
-    // If current_driver is specified, any entry that doesn't belong the driver will
-    // be reposted. The driver id will be used as IOCP handle.
+    // If current_driver is specified, any entry that doesn't belong the driver
+    // will be reposted. The driver id will be used as IOCP handle.
     pub fn poll(
         &self,
         timeout: Option<Duration>,
         current_driver: Option<RawFd>,
     ) -> io::Result<impl Iterator<Item = RawEntry>> {
         let mut entries = Vec::with_capacity(Self::DEFAULT_CAPACITY);
-        let len = match self.poll_raw(timeout, entries.spare_capacity_mut()) {
-            Ok(len) => len,
-            Err(e) if e.raw_os_error() == Some(ERROR_NETNAME_DELETED as _) => 0,
-            Err(e) => return Err(e),
-        };
+        let len = self.poll_raw(timeout, entries.spare_capacity_mut())?;
 
         unsafe { entries.set_len(len) };
         Ok(entries.into_iter().filter_map(move |entry| {
@@ -189,7 +184,6 @@ impl CompletionPort {
                 let error = unsafe { RtlNtStatusToDosError(status) };
                 match error {
                     ERROR_IO_INCOMPLETE
-                    | ERROR_NETNAME_DELETED
                     | ERROR_HANDLE_EOF
                     | ERROR_BROKEN_PIPE
                     | ERROR_PIPE_CONNECTED
@@ -227,5 +221,40 @@ fn ntstatus_from_win32(x: i32) -> NTSTATUS {
         x
     } else {
         ((x) & 0x0000FFFF) | (FACILITY_NTWIN32 << 16) as NTSTATUS | ERROR_SEVERITY_ERROR as NTSTATUS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::Foundation::ERROR_NETNAME_DELETED;
+
+    use super::*;
+
+    #[test]
+    fn connection_reset_is_not_eof() {
+        let port = CompletionPort::new().unwrap();
+        let mut overlapped = Overlapped::new(port.as_raw_handle());
+        port.post(
+            Err(io::Error::from_raw_os_error(ERROR_NETNAME_DELETED as _)),
+            &mut overlapped,
+        )
+        .unwrap();
+        let entries: Vec<_> = port
+            .poll(Some(Duration::from_secs(1)), None)
+            .unwrap()
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].result.as_ref().unwrap_err().raw_os_error(),
+            Some(ERROR_NETNAME_DELETED as _)
+        );
+
+        port.post(Ok(0), &mut overlapped).unwrap();
+        let entries: Vec<_> = port
+            .poll(Some(Duration::from_secs(1)), None)
+            .unwrap()
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(*entries[0].result.as_ref().unwrap(), 0);
     }
 }

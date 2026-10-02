@@ -5,8 +5,8 @@ use windows_sys::{
     Win32::{
         Foundation::{
             ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
-            ERROR_MORE_DATA, ERROR_NETNAME_DELETED, ERROR_NO_DATA, ERROR_NOT_FOUND,
-            ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GetLastError,
+            ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_NOT_FOUND, ERROR_PIPE_CONNECTED,
+            ERROR_PIPE_NOT_CONNECTED, GetLastError,
         },
         Networking::WinSock::{SIO_GET_EXTENSION_FUNCTION_POINTER, WSAIoctl},
         System::IO::{CancelIoEx, OVERLAPPED},
@@ -60,7 +60,6 @@ pub fn winapi_result(transferred: u32) -> Poll<io::Result<usize>> {
     match error {
         ERROR_IO_PENDING => Poll::Pending,
         ERROR_IO_INCOMPLETE
-        | ERROR_NETNAME_DELETED
         | ERROR_HANDLE_EOF
         | ERROR_BROKEN_PIPE
         | ERROR_PIPE_CONNECTED
@@ -121,4 +120,21 @@ pub fn get_wsa_fn<F>(handle: RawFd, fguid: GUID) -> io::Result<Option<F>> {
         )
     )?;
     Ok(fptr)
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::Foundation::{ERROR_NETNAME_DELETED, SetLastError};
+
+    use super::*;
+
+    #[test]
+    fn immediate_connection_reset_is_not_eof() {
+        unsafe { SetLastError(ERROR_NETNAME_DELETED) };
+        let Poll::Ready(Err(error)) = winsock_result(-1, 0) else {
+            panic!("connection reset must remain an error");
+        };
+        assert_eq!(error.raw_os_error(), Some(ERROR_NETNAME_DELETED as _));
+        assert!(matches!(winsock_result(0, 0), Poll::Ready(Ok(0))));
+    }
 }
