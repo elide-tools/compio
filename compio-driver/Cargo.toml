@@ -57,13 +57,13 @@ windows-sys = { workspace = true, features = [
 compile_warning = { version = "0.1.0", optional = true }
 io-uring = { version = "0.7.13", optional = true }
 once_cell = { workspace = true, optional = true }
-polling = { version = "3.3.0", optional = true }
+polling = { git = "https://github.com/elide-tools/polling.git", rev = "1198249b4e54fa430dc6f76b058ad0912bd6bbea", optional = true }
 rustix = { workspace = true }
 linux-raw-sys = { version = "0.12.1", optional = true }
 
 # Other platform dependencies
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
-polling = "3.3.0"
+polling = { git = "https://github.com/elide-tools/polling.git", rev = "1198249b4e54fa430dc6f76b058ad0912bd6bbea" }
 
 [target.'cfg(unix)'.dependencies]
 smallvec = { workspace = true, features = ["union"] }
