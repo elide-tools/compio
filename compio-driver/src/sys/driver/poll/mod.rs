@@ -69,8 +69,8 @@ struct FdQueue {
     armed: Option<Mask>,
     /// Whether this fd is already listed in [`Driver::dirty`].
     listed: bool,
-    /// Interests the source is believed not to be ready for, because an operation saw `EAGAIN` or
-    /// because the last readiness for that interest was consumed.
+    /// Interests for which another optimistic attempt is not justified: blocked attempts,
+    /// errors, and short receives. Full receives can leave more queued bytes to drain.
     ///
     /// Level triggering makes a wrong belief self-correcting: a source that is in fact ready
     /// reports itself again as soon as it is registered, so the worst case is one delayed wakeup,
@@ -446,7 +446,15 @@ impl Driver {
                 }
                 Poll::Pending
             }
-            Decision::Completed(res) => Poll::Ready(Ok(res)),
+            Decision::Completed(res) => {
+                if let Some(arg) = hint {
+                    let remains = key.borrow().carrier.readiness_may_remain(&Ok(res));
+                    if let Some(queue) = self.registry.get_mut(&arg.fd) {
+                        queue.stale.set(arg.interest, !remains);
+                    }
+                }
+                Poll::Ready(Ok(res))
+            }
             Decision::Blocking => {
                 self.push_blocking(key);
                 Poll::Pending
@@ -577,17 +585,21 @@ impl Driver {
                 extra.reset();
                 let args = extra.track.iter().map(|t| t.arg).collect::<Vec<_>>();
                 drop(op);
+                if let Some(queue) = self.registry.get_mut(&fd) {
+                    queue.stale.set(interest, true);
+                }
                 for arg in args {
                     // SAFETY: fd is from the OpCode.
                     unsafe { self.submit_front(key.clone(), arg) };
                 }
             }
             Poll::Ready(res) => {
+                let remains = op.carrier.readiness_may_remain(&res);
                 drop(op);
-                // The operation consumed this readiness. Assume it is spent; level triggering
-                // reports the source again on the next wait if it is not.
+                // A full receive can leave queued bytes; a short receive can wait for the
+                // next readiness report, avoiding an extra syscall just to observe EAGAIN.
                 if let Some(queue) = self.registry.get_mut(&fd) {
-                    queue.stale.set(interest, true);
+                    queue.stale.set(interest, !remains);
                 }
                 Entry::new(key, res).notify()
             }
