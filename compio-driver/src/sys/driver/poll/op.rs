@@ -77,6 +77,13 @@ pub unsafe trait OpCode {
         None
     }
 
+    /// Whether a successful completion warrants another immediate attempt on this source.
+    /// Short receives can wait for fresh level-triggered readiness instead of spending an
+    /// extra syscall on `EAGAIN`; full receives may still have queued bytes to drain.
+    fn readiness_may_remain(&mut self, _: &mut Self::Control, result: &io::Result<usize>) -> bool {
+        result.is_ok()
+    }
+
     /// Perform the operation after received corresponding
     /// event. If this operation is blocking, the return value should be
     /// [`Poll::Ready`].
@@ -102,6 +109,7 @@ pub(crate) trait Carry {
     fn pre_submit(&mut self) -> io::Result<Decision>;
     fn op_type(&mut self) -> Option<OpType>;
     fn interest_hint(&mut self) -> Option<WaitArg>;
+    fn readiness_may_remain(&mut self, result: &io::Result<usize>) -> bool;
     fn operate(&mut self) -> Poll<io::Result<usize>>;
     unsafe fn set_result(&mut self, _: &io::Result<usize>, _: &crate::Extra);
 }
@@ -132,6 +140,11 @@ impl<T: crate::OpCode> Carry for Carrier<T> {
     fn interest_hint(&mut self) -> Option<WaitArg> {
         let (op, control) = self.as_poll();
         op.interest_hint(control)
+    }
+
+    fn readiness_may_remain(&mut self, result: &io::Result<usize>) -> bool {
+        let (op, control) = self.as_poll();
+        op.readiness_may_remain(control, result)
     }
 
     fn operate(&mut self) -> Poll<io::Result<usize>> {

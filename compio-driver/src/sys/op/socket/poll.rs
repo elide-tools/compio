@@ -124,6 +124,10 @@ unsafe impl<T: IoBufMut, S: AsFd> OpCode for Recv<T, S> {
         })
     }
 
+    fn readiness_may_remain(&mut self, _: &mut Self::Control, result: &io::Result<usize>) -> bool {
+        result.as_ref().is_ok_and(|length| *length == self.buffer.buf_capacity())
+    }
+
     fn pre_submit(&mut self, _: &mut Self::Control) -> io::Result<Decision> {
         decide(self.fd.as_fd().as_raw_fd(), Readable, || self.call())
     }
