@@ -69,8 +69,8 @@ struct FdQueue {
     armed: Option<Mask>,
     /// Whether this fd is already listed in [`Driver::dirty`].
     listed: bool,
-    /// Interests the source is believed not to be ready for, because an operation saw `EAGAIN` or
-    /// because the last readiness for that interest was consumed.
+    /// Interests the source is believed not to be ready for because an operation saw `EAGAIN`.
+    /// Successful I/O can leave more bytes or capacity ready; only a blocked attempt exhausts it.
     ///
     /// Level triggering makes a wrong belief self-correcting: a source that is in fact ready
     /// reports itself again as soon as it is registered, so the worst case is one delayed wakeup,
@@ -577,6 +577,9 @@ impl Driver {
                 extra.reset();
                 let args = extra.track.iter().map(|t| t.arg).collect::<Vec<_>>();
                 drop(op);
+                if let Some(queue) = self.registry.get_mut(&fd) {
+                    queue.stale.set(interest, true);
+                }
                 for arg in args {
                     // SAFETY: fd is from the OpCode.
                     unsafe { self.submit_front(key.clone(), arg) };
@@ -584,10 +587,11 @@ impl Driver {
             }
             Poll::Ready(res) => {
                 drop(op);
-                // The operation consumed this readiness. Assume it is spent; level triggering
-                // reports the source again on the next wait if it is not.
+                // Successful I/O may leave the source ready (for example, a bounded read
+                // with bytes still queued). Let the next submission drain it immediately.
+                // Errors do not warrant another optimistic attempt before fresh readiness.
                 if let Some(queue) = self.registry.get_mut(&fd) {
-                    queue.stale.set(interest, true);
+                    queue.stale.set(interest, res.is_err());
                 }
                 Entry::new(key, res).notify()
             }
